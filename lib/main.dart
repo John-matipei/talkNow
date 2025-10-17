@@ -1,12 +1,13 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
-import 'dart:convert';
+import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:socket_io_client/socket_io_client.dart' as IO;
-import 'package:share_plus/share_plus.dart';
 import 'package:fluttertoast/fluttertoast.dart';
 
-// ✅ Define your backend IP here
-const backendIP = '192.168.0.107'; // Replace with your PC LAN IP
+// ✅ Replace with your backend IP
+const backendIP = '192.168.0.107';
+final backendBaseUrl = 'http://$backendIP:5000';
 
 void main() {
   runApp(const TalkNowApp());
@@ -23,7 +24,33 @@ class TalkNowApp extends StatelessWidget {
       theme: ThemeData(
         brightness: Brightness.dark,
         primarySwatch: Colors.deepPurple,
-        scaffoldBackgroundColor: const Color(0xFF121212),
+        scaffoldBackgroundColor: const Color(0xFF0E0E10),
+        inputDecorationTheme: InputDecorationTheme(
+          filled: true,
+          fillColor: const Color(0xFF1E1E2C),
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(15),
+            borderSide: const BorderSide(color: Colors.deepPurple),
+          ),
+          focusedBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(15),
+            borderSide: const BorderSide(color: Colors.purpleAccent, width: 2),
+          ),
+          labelStyle: const TextStyle(color: Colors.white70),
+        ),
+        elevatedButtonTheme: ElevatedButtonThemeData(
+          style: ElevatedButton.styleFrom(
+            backgroundColor: Colors.deepPurpleAccent,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(20),
+            ),
+            padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 14),
+            textStyle: const TextStyle(
+              fontSize: 18,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ),
       ),
       home: const MeetingHomePage(),
     );
@@ -40,217 +67,259 @@ class MeetingHomePage extends StatefulWidget {
 class _MeetingHomePageState extends State<MeetingHomePage> {
   final roomController = TextEditingController();
   final usernameController = TextEditingController();
-  final commentController = TextEditingController();
-  final List<String> comments = [];
+
+  final localRenderer = RTCVideoRenderer();
+  final remoteRenderer = RTCVideoRenderer();
 
   late IO.Socket socket;
+  RTCPeerConnection? peerConnection;
+  MediaStream? localStream;
+  bool inMeeting = false;
   String? meetingId;
-  bool meetingActive = false;
-  String? meetingLink;
 
   @override
   void initState() {
     super.initState();
+    localRenderer.initialize();
+    remoteRenderer.initialize();
     connectSocket();
+  }
+
+  @override
+  void dispose() {
+    localRenderer.dispose();
+    remoteRenderer.dispose();
+    super.dispose();
   }
 
   void connectSocket() {
     socket = IO.io(
-      'http://$backendIP:5000', // Use backendIP constant
+      backendBaseUrl,
       IO.OptionBuilder().setTransports(['websocket']).build(),
     );
 
     socket.onConnect((_) {
-      print('Connected to Socket Server ✅');
+      print('✅ Connected to Socket Server');
     });
 
-    socket.on('newParticipant', (username) {
-      Fluttertoast.showToast(msg: "👋 $username joined the meeting");
+    socket.on('offer', (data) async {
+      await _handleOffer(data);
     });
 
-    socket.on('receiveMessage', (message) {
-      setState(() {
-        comments.add(message);
-      });
+    socket.on('answer', (data) async {
+      await peerConnection?.setRemoteDescription(
+        RTCSessionDescription(data['sdp'], data['type']),
+      );
+    });
+
+    socket.on('candidate', (data) async {
+      await peerConnection?.addCandidate(
+        RTCIceCandidate(data['candidate'], data['sdpMid'], data['sdpMLineIndex']),
+      );
+    });
+  }
+
+  Future<void> _initLocalStream() async {
+    localStream = await navigator.mediaDevices.getUserMedia({
+      'audio': true,
+      'video': {'facingMode': 'user'}
+    });
+    localRenderer.srcObject = localStream;
+  }
+
+  Future<void> _createPeerConnection(String roomId) async {
+    peerConnection = await createPeerConnection({
+      'iceServers': [
+        {'urls': 'stun:stun.l.google.com:19302'},
+      ]
+    });
+
+    peerConnection!.onIceCandidate = (candidate) {
+      if (candidate != null) {
+        socket.emit('candidate', {
+          'meetingId': roomId,
+          'candidate': candidate.candidate,
+          'sdpMid': candidate.sdpMid,
+          'sdpMLineIndex': candidate.sdpMLineIndex,
+        });
+      }
+    };
+
+    peerConnection!.onTrack = (event) {
+      if (event.streams.isNotEmpty) {
+        remoteRenderer.srcObject = event.streams[0];
+      }
+    };
+
+    localStream?.getTracks().forEach((track) {
+      peerConnection!.addTrack(track, localStream!);
     });
   }
 
   Future<void> createMeeting() async {
-    final response =
-    await http.post(Uri.parse('http://$backendIP:5000/create-meeting'));
+    await _initLocalStream();
 
-    if (response.statusCode == 200) {
-      final data = json.decode(response.body);
+    final res = await http.post(Uri.parse('$backendBaseUrl/create-meeting'));
+    if (res.statusCode == 200) {
+      final data = jsonDecode(res.body);
+      final id = data['meetingId'];
       setState(() {
-        meetingId = data['meetingId'];
-        meetingLink = "http://$backendIP:5000/meeting/$meetingId";
-        meetingActive = true;
+        meetingId = id;
+        inMeeting = true;
       });
-      Fluttertoast.showToast(msg: "✅ Meeting created!");
+
+      socket.emit('createRoom', {'meetingId': id});
+      await _createPeerConnection(id);
+      Fluttertoast.showToast(msg: '✅ Meeting created: $id');
     }
   }
 
   Future<void> joinMeeting() async {
+    await _initLocalStream();
+
     final id = roomController.text.trim();
     final username = usernameController.text.trim();
-
     if (id.isEmpty || username.isEmpty) {
-      Fluttertoast.showToast(msg: "Enter Meeting ID and Username");
+      Fluttertoast.showToast(msg: 'Enter meeting ID and username');
       return;
     }
 
-    final response = await http.post(
-      Uri.parse('http://$backendIP:5000/join-meeting'),
-      headers: {'Content-Type': 'application/json'},
-      body: json.encode({'meetingId': id, 'username': username}),
-    );
+    setState(() {
+      meetingId = id;
+      inMeeting = true;
+    });
 
-    if (response.statusCode == 200) {
-      socket.emit('joinRoom', {'meetingId': id, 'username': username});
-
-      setState(() {
-        meetingId = id;
-        meetingLink = "http://$backendIP:5000/meeting/$id";
-        meetingActive = true;
-      });
-      Fluttertoast.showToast(msg: "✅ Joined meeting successfully!");
-    } else {
-      Fluttertoast.showToast(msg: "❌ Meeting not found!");
-    }
+    socket.emit('joinRoom', {'meetingId': id, 'username': username});
+    await _createPeerConnection(id);
   }
 
-  void sendMessage() {
-    final msg = commentController.text.trim();
-    if (msg.isEmpty || meetingId == null) return;
-
-    socket.emit('sendMessage', {'meetingId': meetingId, 'message': msg});
-
-    setState(() {
-      comments.add("Me: $msg");
-      commentController.clear();
+  Future<void> _handleOffer(Map data) async {
+    await _createPeerConnection(data['meetingId']);
+    await peerConnection!.setRemoteDescription(
+      RTCSessionDescription(data['sdp'], data['type']),
+    );
+    final answer = await peerConnection!.createAnswer();
+    await peerConnection!.setLocalDescription(answer);
+    socket.emit('answer', {
+      'meetingId': data['meetingId'],
+      'sdp': answer.sdp,
+      'type': answer.type,
     });
   }
 
   void endMeeting() {
+    localStream?.getTracks().forEach((track) => track.stop());
+    peerConnection?.close();
     socket.disconnect();
     setState(() {
-      meetingActive = false;
-      meetingId = null;
-      meetingLink = null;
-      comments.clear();
+      inMeeting = false;
     });
-    Fluttertoast.showToast(msg: "❌ Meeting ended.");
-  }
-
-  void shareMeetingLink() {
-    if (meetingLink != null) {
-      Share.share("Join my meeting: $meetingLink");
-    }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text("Talk Now"),
+        title: const Text('Talk Now'),
+        backgroundColor: Colors.deepPurpleAccent.withOpacity(0.8),
+        elevation: 10,
+        shadowColor: Colors.purpleAccent,
         centerTitle: true,
-        backgroundColor: Colors.deepPurple,
+        titleTextStyle: const TextStyle(
+          fontSize: 22,
+          fontWeight: FontWeight.bold,
+          color: Colors.white,
+        ),
       ),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: !meetingActive
-            ? Column(
-          children: [
-            TextField(
-              controller: usernameController,
-              decoration: InputDecoration(
-                labelText: "Your Name",
-                filled: true,
-                fillColor: Colors.white,
-                border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(12)),
-                labelStyle: const TextStyle(color: Colors.black),
-              ),
-              style: const TextStyle(color: Colors.black),
+      body: Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            colors: [Color(0xFF1F1B24), Color(0xFF2C1A4D), Color(0xFF120E43)],
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+          ),
+        ),
+        padding: const EdgeInsets.all(20),
+        child: !inMeeting
+            ? Center(
+          child: SingleChildScrollView(
+            child: Column(
+              children: [
+                const Icon(Icons.videocam_rounded,
+                    size: 100, color: Colors.purpleAccent),
+                const SizedBox(height: 10),
+                const Text(
+                  "Welcome to Talk Now -Developed by John",
+                  style: TextStyle(
+                    fontSize: 26,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                  ),
+                ),
+                const SizedBox(height: 30),
+                TextField(
+                  controller: usernameController,
+                  decoration: const InputDecoration(
+                    labelText: "Your Name",
+                    prefixIcon:
+                    Icon(Icons.person, color: Colors.purpleAccent),
+                  ),
+                ),
+                const SizedBox(height: 15),
+                TextField(
+                  controller: roomController,
+                  decoration: const InputDecoration(
+                    labelText: "Meeting ID",
+                    prefixIcon:
+                    Icon(Icons.meeting_room, color: Colors.purpleAccent),
+                  ),
+                ),
+                const SizedBox(height: 30),
+                ElevatedButton.icon(
+                  onPressed: createMeeting,
+                  icon: const Icon(Icons.add_circle_outline),
+                  label: const Text('Create Meeting'),
+                ),
+                const SizedBox(height: 10),
+                ElevatedButton.icon(
+                  onPressed: joinMeeting,
+                  icon: const Icon(Icons.login),
+                  label: const Text('Join Meeting'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.purple,
+                  ),
+                ),
+              ],
             ),
-            const SizedBox(height: 10),
-            TextField(
-              controller: roomController,
-              decoration: InputDecoration(
-                labelText: "Meeting ID (optional to join existing)",
-                filled: true,
-                fillColor: Colors.white,
-                border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(12)),
-                labelStyle: const TextStyle(color: Colors.black),
-              ),
-              style: const TextStyle(color: Colors.black),
-            ),
-            const SizedBox(height: 20),
-            ElevatedButton.icon(
-              onPressed: createMeeting,
-              icon: const Icon(Icons.video_call),
-              label: const Text("Create Meeting"),
-              style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.deepPurple),
-            ),
-            const SizedBox(height: 10),
-            ElevatedButton.icon(
-              onPressed: joinMeeting,
-              icon: const Icon(Icons.meeting_room),
-              label: const Text("Join Meeting"),
-              style:
-              ElevatedButton.styleFrom(backgroundColor: Colors.teal),
-            ),
-          ],
+          ),
         )
             : Column(
           children: [
-            Text("Meeting ID: $meetingId"),
+            Expanded(
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(15),
+                child: RTCVideoView(localRenderer, mirror: true),
+              ),
+            ),
             const SizedBox(height: 10),
-            ElevatedButton.icon(
-              onPressed: shareMeetingLink,
-              icon: const Icon(Icons.link),
-              label: const Text("Share Meeting Link"),
+            Expanded(
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(15),
+                child: RTCVideoView(remoteRenderer),
+              ),
             ),
             const SizedBox(height: 10),
             ElevatedButton.icon(
               onPressed: endMeeting,
               icon: const Icon(Icons.call_end),
-              label: const Text("End Meeting"),
+              label: const Text('End Meeting'),
               style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.redAccent),
-            ),
-            const Divider(),
-            Expanded(
-              child: ListView.builder(
-                itemCount: comments.length,
-                itemBuilder: (context, index) {
-                  return ListTile(
-                    title: Text(comments[index]),
-                  );
-                },
+                backgroundColor: Colors.redAccent,
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 60, vertical: 14),
               ),
             ),
-            Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: commentController,
-                    decoration: const InputDecoration(
-                      hintText: "Type message...",
-                      filled: true,
-                      fillColor: Colors.white,
-                    ),
-                    style: const TextStyle(color: Colors.black),
-                  ),
-                ),
-                IconButton(
-                  icon: const Icon(Icons.send, color: Colors.teal),
-                  onPressed: sendMessage,
-                )
-              ],
-            )
+            const SizedBox(height: 15),
           ],
         ),
       ),
