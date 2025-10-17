@@ -1,0 +1,11 @@
+[build]
+publish = "build/web"
+command = """
+  git clone https://github.com/flutter/flutter.git --branch stable
+  export PATH="$PATH:`pwd`/flutter/bin"
+  flutter config --enable-web
+  flutter build web
+  """
+
+[build.environment]
+FLUTTER_VERSION = "stable"
