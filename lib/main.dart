@@ -21,7 +21,18 @@ class TalkNowApp extends StatelessWidget {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'Talk Now',
-      theme: ThemeData.dark(),
+      theme: ThemeData.dark().copyWith(
+        elevatedButtonTheme: ElevatedButtonThemeData(
+          style: ElevatedButton.styleFrom(
+            minimumSize: const Size.fromHeight(50),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          ),
+        ),
+        scaffoldBackgroundColor: Colors.deepPurple[900],
+        appBarTheme: const AppBarTheme(
+          backgroundColor: Colors.deepPurpleAccent,
+        ),
+      ),
       home: const LandingPage(),
     );
   }
@@ -40,7 +51,10 @@ class _LandingPageState extends State<LandingPage> {
 
   Future<void> _createMeeting() async {
     final username = usernameController.text.trim();
-    if (username.isEmpty) return;
+    if (username.isEmpty) {
+      _showMessage('Please enter your name');
+      return;
+    }
 
     try {
       final res = await http.post(
@@ -56,32 +70,36 @@ class _LandingPageState extends State<LandingPage> {
         Navigator.push(
           context,
           MaterialPageRoute(
-              builder: (_) => MeetingPage(
-                meetingId: meetingId,
-                username: username,
-                isHost: true,
-              )),
+            builder: (_) => MeetingPage(meetingId: meetingId, username: username, isHost: true),
+          ),
         );
+      } else {
+        _showMessage('Failed to create meeting');
       }
     } catch (e) {
-      print(e);
+      _showMessage('Could not reach server: $e');
     }
   }
 
   void _joinMeeting() {
     final username = usernameController.text.trim();
     final meetingId = roomController.text.trim();
-    if (username.isEmpty || meetingId.isEmpty) return;
+
+    if (username.isEmpty || meetingId.isEmpty) {
+      _showMessage('Please enter your name and meeting ID');
+      return;
+    }
 
     Navigator.push(
       context,
       MaterialPageRoute(
-          builder: (_) => MeetingPage(
-            meetingId: meetingId,
-            username: username,
-            isHost: false,
-          )),
+        builder: (_) => MeetingPage(meetingId: meetingId, username: username, isHost: false),
+      ),
     );
+  }
+
+  void _showMessage(String msg) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
   }
 
   @override
@@ -99,23 +117,54 @@ class _LandingPageState extends State<LandingPage> {
           child: SingleChildScrollView(
             padding: const EdgeInsets.all(20),
             child: Column(
+              crossAxisAlignment: CrossAxisAlignment.center,
               children: [
                 const Icon(Icons.videocam_rounded, size: 100, color: Colors.white),
                 const SizedBox(height: 10),
                 const Text(
                   "Welcome to Talk Now",
-                  style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold, color: Colors.white),
+                  style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: Colors.white),
                 ),
                 const SizedBox(height: 30),
-                TextField(controller: usernameController, style: const TextStyle(color: Colors.white), decoration: const InputDecoration(labelText: 'Your Name', prefixIcon: Icon(Icons.person, color: Colors.white))),
+                _buildInputField(usernameController, 'Your Name', Icons.person),
                 const SizedBox(height: 15),
-                TextField(controller: roomController, style: const TextStyle(color: Colors.white), decoration: const InputDecoration(labelText: 'Meeting ID', prefixIcon: Icon(Icons.meeting_room, color: Colors.white))),
+                _buildInputField(roomController, 'Meeting ID', Icons.meeting_room),
                 const SizedBox(height: 30),
-                ElevatedButton.icon(onPressed: _createMeeting, icon: const Icon(Icons.add_circle_outline), label: const Text('Create Meeting'), style: ElevatedButton.styleFrom(backgroundColor: Colors.deepPurpleAccent, minimumSize: const Size.fromHeight(50))),
+                ElevatedButton.icon(
+                  onPressed: _createMeeting,
+                  icon: const Icon(Icons.add_circle_outline),
+                  label: const Text('Create Meeting'),
+                  style: ElevatedButton.styleFrom(backgroundColor: Colors.deepPurpleAccent),
+                ),
                 const SizedBox(height: 10),
-                ElevatedButton.icon(onPressed: _joinMeeting, icon: const Icon(Icons.login), label: const Text('Join Meeting'), style: ElevatedButton.styleFrom(backgroundColor: Colors.purple, minimumSize: const Size.fromHeight(50))),
+                ElevatedButton.icon(
+                  onPressed: _joinMeeting,
+                  icon: const Icon(Icons.login),
+                  label: const Text('Join Meeting'),
+                  style: ElevatedButton.styleFrom(backgroundColor: Colors.purple),
+                ),
               ],
             ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildInputField(TextEditingController controller, String label, IconData icon) {
+    return Card(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
+      color: Colors.white.withOpacity(0.1),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 10),
+        child: TextField(
+          controller: controller,
+          style: const TextStyle(color: Colors.white),
+          decoration: InputDecoration(
+            labelText: label,
+            prefixIcon: Icon(icon, color: Colors.white),
+            labelStyle: const TextStyle(color: Colors.white70),
+            border: InputBorder.none,
           ),
         ),
       ),
@@ -128,6 +177,7 @@ class MeetingPage extends StatefulWidget {
   final String meetingId;
   final String username;
   final bool isHost;
+
   const MeetingPage({super.key, required this.meetingId, required this.username, required this.isHost});
 
   @override
@@ -206,14 +256,16 @@ class _MeetingPageState extends State<MeetingPage> {
         case 'offer':
           if (!widget.isHost) {
             await _createPeerConnection();
-            await peerConnection!.setRemoteDescription(RTCSessionDescription(data['sdp'], data['type']));
+            await peerConnection!.setRemoteDescription(RTCSessionDescription(data['sdp'], 'offer'));
             final answer = await peerConnection!.createAnswer();
             await peerConnection!.setLocalDescription(answer);
             socket!.add(jsonEncode({'type': 'answer', 'meetingId': widget.meetingId, 'sdp': answer.sdp}));
           }
           break;
         case 'answer':
-          if (widget.isHost) await peerConnection!.setRemoteDescription(RTCSessionDescription(data['sdp'], data['type']));
+          if (widget.isHost) {
+            await peerConnection!.setRemoteDescription(RTCSessionDescription(data['sdp'], 'answer'));
+          }
           break;
         case 'candidate':
           await peerConnection!.addCandidate(RTCIceCandidate(data['candidate'], data['sdpMid'], data['sdpMLineIndex']));
@@ -241,18 +293,43 @@ class _MeetingPageState extends State<MeetingPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: Text('Meeting ID: ${widget.meetingId}'), backgroundColor: Colors.deepPurpleAccent, actions: [IconButton(onPressed: _shareMeetingId, icon: const Icon(Icons.share))]),
+      appBar: AppBar(
+        title: Text('Meeting ID: ${widget.meetingId}'),
+        actions: [IconButton(onPressed: _shareMeetingId, icon: const Icon(Icons.share))],
+      ),
       body: Column(
         children: [
-          Expanded(child: Container(margin: const EdgeInsets.all(8), decoration: BoxDecoration(border: Border.all(color: Colors.purpleAccent, width: 2), borderRadius: BorderRadius.circular(12)), child: RTCVideoView(localRenderer, mirror: true))),
-          Expanded(child: Container(margin: const EdgeInsets.all(8), decoration: BoxDecoration(border: Border.all(color: Colors.purpleAccent, width: 2), borderRadius: BorderRadius.circular(12)), child: RTCVideoView(remoteRenderer))),
+          Expanded(
+            child: Container(
+              margin: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                  border: Border.all(color: Colors.purpleAccent, width: 2),
+                  borderRadius: BorderRadius.circular(12)),
+              child: RTCVideoView(localRenderer, mirror: true),
+            ),
+          ),
+          Expanded(
+            child: Container(
+              margin: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                  border: Border.all(color: Colors.purpleAccent, width: 2),
+                  borderRadius: BorderRadius.circular(12)),
+              child: RTCVideoView(remoteRenderer),
+            ),
+          ),
           Padding(
-            padding: const EdgeInsets.all(8.0),
+            padding: const EdgeInsets.all(12.0),
             child: Column(
               children: [
-                Text('Participants: ${participants.join(", ")}', style: const TextStyle(fontSize: 16, color: Colors.white)),
+                Text('Participants: ${participants.join(", ")}',
+                    style: const TextStyle(fontSize: 16, color: Colors.white)),
                 const SizedBox(height: 10),
-                ElevatedButton.icon(onPressed: _endMeeting, icon: const Icon(Icons.call_end), label: const Text('End Meeting'), style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent, minimumSize: const Size.fromHeight(50))),
+                ElevatedButton.icon(
+                  onPressed: _endMeeting,
+                  icon: const Icon(Icons.call_end),
+                  label: const Text('End Meeting'),
+                  style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+                ),
               ],
             ),
           )
