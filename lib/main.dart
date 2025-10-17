@@ -1,8 +1,10 @@
 import 'dart:convert';
-import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:http/http.dart' as http;
 import 'package:clipboard/clipboard.dart';
+import 'dart:io';
+import 'package:flutter/foundation.dart'; // for kIsWeb
 
 const backendIP = '192.168.0.107';
 final backendBaseUrl = 'http://$backendIP:5000';
@@ -48,36 +50,30 @@ class _LandingPageState extends State<LandingPage> {
     }
 
     try {
-      final request = await HttpClient().postUrl(
-          Uri.parse('$backendBaseUrl/create-meeting'));
-      request.headers.contentType = ContentType.json;
-      request.write(jsonEncode({'username': username}));
-      final response = await request.close();
-
-      if (response.statusCode != 200) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Server error: ${response.statusCode}')),
-        );
-        return;
-      }
-
-      final body = await response.transform(utf8.decoder).join();
-      final data = jsonDecode(body);
-      final meetingId = data['meetingId'];
-
-      Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (_) => MeetingPage(
-            meetingId: meetingId,
-            username: username,
-            isHost: true,
-          ),
-        ),
+      final res = await http.post(
+        Uri.parse('$backendBaseUrl/create-meeting'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'username': username}),
       );
+
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body);
+        final meetingId = data['meetingId'];
+        if (!mounted) return;
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (_) => MeetingPage(meetingId: meetingId, username: username),
+          ),
+        );
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to create meeting. Server responded with ${res.statusCode}')),
+        );
+      }
     } catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error: $e')),
+        SnackBar(content: Text('Could not reach server: $e')),
       );
     }
   }
@@ -85,6 +81,7 @@ class _LandingPageState extends State<LandingPage> {
   void _joinMeeting() {
     final username = usernameController.text.trim();
     final meetingId = roomController.text.trim();
+
     if (username.isEmpty || meetingId.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Please enter name and meeting ID')),
@@ -95,11 +92,7 @@ class _LandingPageState extends State<LandingPage> {
     Navigator.push(
       context,
       MaterialPageRoute(
-        builder: (_) => MeetingPage(
-          meetingId: meetingId,
-          username: username,
-          isHost: false,
-        ),
+        builder: (_) => MeetingPage(meetingId: meetingId, username: username),
       ),
     );
   }
@@ -202,9 +195,7 @@ class _LandingPageState extends State<LandingPage> {
 class MeetingPage extends StatefulWidget {
   final String meetingId;
   final String username;
-  final bool isHost;
-
-  const MeetingPage({super.key, required this.meetingId, required this.username, required this.isHost});
+  const MeetingPage({super.key, required this.meetingId, required this.username});
 
   @override
   State<MeetingPage> createState() => _MeetingPageState();
@@ -222,7 +213,7 @@ class _MeetingPageState extends State<MeetingPage> {
   void initState() {
     super.initState();
     _initRenderers();
-    _initMeeting();
+    _startMeeting();
   }
 
   Future<void> _initRenderers() async {
@@ -231,10 +222,8 @@ class _MeetingPageState extends State<MeetingPage> {
   }
 
   Future<void> _initLocalStream() async {
-    localStream = await navigator.mediaDevices.getUserMedia({
-      'audio': true,
-      'video': {'facingMode': 'user'}
-    });
+    localStream = await navigator.mediaDevices
+        .getUserMedia({'audio': true, 'video': {'facingMode': 'user'}});
     localRenderer.srcObject = localStream;
   }
 
@@ -275,68 +264,40 @@ class _MeetingPageState extends State<MeetingPage> {
       final data = jsonDecode(event);
       switch (data['type']) {
         case 'offer':
-          if (!widget.isHost) {
-            await _createPeerConnection();
-            await peerConnection!.setRemoteDescription(
-                RTCSessionDescription(data['sdp'], data['type']));
-            final answer = await peerConnection!.createAnswer();
-            await peerConnection!.setLocalDescription(answer);
-            socket!.add(jsonEncode({
-              'type': 'answer',
-              'meetingId': widget.meetingId,
-              'sdp': answer.sdp
-            }));
-          }
+          await _createPeerConnection();
+          await peerConnection!.setRemoteDescription(
+              RTCSessionDescription(data['sdp'], data['type']));
+          final answer = await peerConnection!.createAnswer();
+          await peerConnection!.setLocalDescription(answer);
+          socket!.add(jsonEncode({
+            'type': 'answer',
+            'meetingId': widget.meetingId,
+            'sdp': answer.sdp
+          }));
           break;
-
         case 'answer':
-          if (widget.isHost) {
-            await peerConnection!.setRemoteDescription(
-                RTCSessionDescription(data['sdp'], data['type']));
-          }
+          await peerConnection!.setRemoteDescription(
+              RTCSessionDescription(data['sdp'], data['type']));
           break;
-
         case 'candidate':
           await peerConnection!.addCandidate(RTCIceCandidate(
               data['candidate'], data['sdpMid'], data['sdpMLineIndex']));
           break;
-
-        case 'participants':
-          final list = List<String>.from(data['list']);
-          setState(() {
-            participants = list;
-          });
-          break;
       }
     });
 
-    // Join room
-    socket!.add(jsonEncode({
-      'type': 'joinRoom',
-      'meetingId': widget.meetingId,
-      'username': widget.username,
-      'isHost': widget.isHost
-    }));
-
-    setState(() {
-      participants.add(widget.username);
-    });
+    socket!.add(jsonEncode(
+        {'type': 'joinRoom', 'meetingId': widget.meetingId, 'username': widget.username}));
+    participants.add(widget.username);
   }
 
-  Future<void> _initMeeting() async {
+  Future<void> _startMeeting() async {
     await _initLocalStream();
     await _connectSocket();
-
-    if (widget.isHost) {
-      await _createPeerConnection();
-      final offer = await peerConnection!.createOffer();
-      await peerConnection!.setLocalDescription(offer);
-      socket!.add(jsonEncode({
-        'type': 'offer',
-        'meetingId': widget.meetingId,
-        'sdp': offer.sdp
-      }));
-    }
+    await _createPeerConnection();
+    final offer = await peerConnection!.createOffer();
+    await peerConnection!.setLocalDescription(offer);
+    socket!.add(jsonEncode({'type': 'offer', 'meetingId': widget.meetingId, 'sdp': offer.sdp}));
   }
 
   void _endMeeting() {
@@ -348,8 +309,8 @@ class _MeetingPageState extends State<MeetingPage> {
 
   void _shareMeetingId() {
     FlutterClipboard.copy(widget.meetingId).then((_) {
-      ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Meeting ID copied!')));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('Meeting ID copied!')));
     });
   }
 
