@@ -1,13 +1,12 @@
 import 'dart:convert';
 import 'package:flutter/material.dart';
-import 'package:http/http.dart' as http;
 import 'package:flutter_webrtc/flutter_webrtc.dart';
-import 'package:socket_io_client/socket_io_client.dart' as IO;
-import 'package:fluttertoast/fluttertoast.dart';
+import 'dart:io';
 
-// ✅ Replace with your backend IP
+// Replace with your backend IP or hosted URL
 const backendIP = '192.168.0.107';
 final backendBaseUrl = 'http://$backendIP:5000';
+final wsUrl = 'ws://$backendIP:5000/ws';
 
 void main() {
   runApp(const TalkNowApp());
@@ -21,9 +20,8 @@ class TalkNowApp extends StatelessWidget {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'Talk Now',
-      theme: ThemeData(
-        brightness: Brightness.dark,
-        primarySwatch: Colors.deepPurple,
+      theme: ThemeData.dark().copyWith(
+        primaryColor: Colors.deepPurpleAccent,
         scaffoldBackgroundColor: const Color(0xFF0E0E10),
         inputDecorationTheme: InputDecorationTheme(
           filled: true,
@@ -45,10 +43,7 @@ class TalkNowApp extends StatelessWidget {
               borderRadius: BorderRadius.circular(20),
             ),
             padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 14),
-            textStyle: const TextStyle(
-              fontSize: 18,
-              fontWeight: FontWeight.bold,
-            ),
+            textStyle: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
           ),
         ),
       ),
@@ -65,58 +60,38 @@ class MeetingHomePage extends StatefulWidget {
 }
 
 class _MeetingHomePageState extends State<MeetingHomePage> {
-  final roomController = TextEditingController();
   final usernameController = TextEditingController();
+  final roomController = TextEditingController();
 
   final localRenderer = RTCVideoRenderer();
   final remoteRenderer = RTCVideoRenderer();
 
-  late IO.Socket socket;
   RTCPeerConnection? peerConnection;
   MediaStream? localStream;
+  WebSocket? socket;
+
   bool inMeeting = false;
   String? meetingId;
+  String? username;
 
   @override
   void initState() {
     super.initState();
-    localRenderer.initialize();
-    remoteRenderer.initialize();
-    connectSocket();
+    _initializeRenderers();
+  }
+
+  Future<void> _initializeRenderers() async {
+    await localRenderer.initialize();
+    await remoteRenderer.initialize();
+    setState(() {}); // safe to rebuild
   }
 
   @override
   void dispose() {
     localRenderer.dispose();
     remoteRenderer.dispose();
+    socket?.close();
     super.dispose();
-  }
-
-  void connectSocket() {
-    socket = IO.io(
-      backendBaseUrl,
-      IO.OptionBuilder().setTransports(['websocket']).build(),
-    );
-
-    socket.onConnect((_) {
-      print('✅ Connected to Socket Server');
-    });
-
-    socket.on('offer', (data) async {
-      await _handleOffer(data);
-    });
-
-    socket.on('answer', (data) async {
-      await peerConnection?.setRemoteDescription(
-        RTCSessionDescription(data['sdp'], data['type']),
-      );
-    });
-
-    socket.on('candidate', (data) async {
-      await peerConnection?.addCandidate(
-        RTCIceCandidate(data['candidate'], data['sdpMid'], data['sdpMLineIndex']),
-      );
-    });
   }
 
   Future<void> _initLocalStream() async {
@@ -127,21 +102,22 @@ class _MeetingHomePageState extends State<MeetingHomePage> {
     localRenderer.srcObject = localStream;
   }
 
-  Future<void> _createPeerConnection(String roomId) async {
-    peerConnection = await createPeerConnection({
+  Future<void> _createPeerConnection() async {
+    peerConnection ??= await createPeerConnection({
       'iceServers': [
-        {'urls': 'stun:stun.l.google.com:19302'},
+        {'urls': 'stun:stun.l.google.com:19302'}
       ]
     });
 
     peerConnection!.onIceCandidate = (candidate) {
       if (candidate != null) {
-        socket.emit('candidate', {
-          'meetingId': roomId,
+        socket?.add(jsonEncode({
+          'type': 'candidate',
+          'meetingId': meetingId,
           'candidate': candidate.candidate,
           'sdpMid': candidate.sdpMid,
-          'sdpMLineIndex': candidate.sdpMLineIndex,
-        });
+          'sdpMLineIndex': candidate.sdpMLineIndex
+        }));
       }
     };
 
@@ -156,64 +132,92 @@ class _MeetingHomePageState extends State<MeetingHomePage> {
     });
   }
 
+  Future<void> _connectSocket() async {
+    socket = await WebSocket.connect(wsUrl);
+
+    socket!.listen((event) async {
+      final data = jsonDecode(event);
+      switch (data['type']) {
+        case 'offer':
+          await _createPeerConnection();
+          await peerConnection!.setRemoteDescription(
+            RTCSessionDescription(data['sdp'], 'offer'),
+          );
+          final answer = await peerConnection!.createAnswer();
+          await peerConnection!.setLocalDescription(answer);
+          socket!.add(jsonEncode({
+            'type': 'answer',
+            'meetingId': meetingId,
+            'sdp': answer.sdp,
+          }));
+          break;
+
+        case 'answer':
+          await peerConnection!.setRemoteDescription(
+            RTCSessionDescription(data['sdp'], 'answer'),
+          );
+          break;
+
+        case 'candidate':
+          await peerConnection!.addCandidate(
+            RTCIceCandidate(data['candidate'], data['sdpMid'], data['sdpMLineIndex']),
+          );
+          break;
+      }
+    });
+
+    socket!.add(jsonEncode({
+      'type': 'joinRoom',
+      'meetingId': meetingId,
+      'username': username,
+    }));
+  }
+
   Future<void> createMeeting() async {
     await _initLocalStream();
+    final res = await HttpClient()
+        .postUrl(Uri.parse('$backendBaseUrl/create-meeting'))
+        .then((req) => req.close());
+    final body = await res.transform(utf8.decoder).join();
+    final data = jsonDecode(body);
 
-    final res = await http.post(Uri.parse('$backendBaseUrl/create-meeting'));
-    if (res.statusCode == 200) {
-      final data = jsonDecode(res.body);
-      final id = data['meetingId'];
-      setState(() {
-        meetingId = id;
-        inMeeting = true;
-      });
+    meetingId = data['meetingId'];
+    username = usernameController.text.trim();
+    if (username!.isEmpty) return;
 
-      socket.emit('createRoom', {'meetingId': id});
-      await _createPeerConnection(id);
-      Fluttertoast.showToast(msg: '✅ Meeting created: $id');
-    }
+    await _connectSocket();
+    await _createPeerConnection();
+
+    final offer = await peerConnection!.createOffer();
+    await peerConnection!.setLocalDescription(offer);
+
+    socket!.add(jsonEncode({
+      'type': 'offer',
+      'meetingId': meetingId,
+      'sdp': offer.sdp,
+    }));
+
+    setState(() => inMeeting = true); // update UI after everything is ready
   }
 
   Future<void> joinMeeting() async {
     await _initLocalStream();
+    meetingId = roomController.text.trim();
+    username = usernameController.text.trim();
+    if (meetingId!.isEmpty || username!.isEmpty) return;
 
-    final id = roomController.text.trim();
-    final username = usernameController.text.trim();
-    if (id.isEmpty || username.isEmpty) {
-      Fluttertoast.showToast(msg: 'Enter meeting ID and username');
-      return;
-    }
+    await _connectSocket();
+    await _createPeerConnection();
 
-    setState(() {
-      meetingId = id;
-      inMeeting = true;
-    });
-
-    socket.emit('joinRoom', {'meetingId': id, 'username': username});
-    await _createPeerConnection(id);
-  }
-
-  Future<void> _handleOffer(Map data) async {
-    await _createPeerConnection(data['meetingId']);
-    await peerConnection!.setRemoteDescription(
-      RTCSessionDescription(data['sdp'], data['type']),
-    );
-    final answer = await peerConnection!.createAnswer();
-    await peerConnection!.setLocalDescription(answer);
-    socket.emit('answer', {
-      'meetingId': data['meetingId'],
-      'sdp': answer.sdp,
-      'type': answer.type,
-    });
+    setState(() => inMeeting = true); // update UI after setup
   }
 
   void endMeeting() {
     localStream?.getTracks().forEach((track) => track.stop());
     peerConnection?.close();
-    socket.disconnect();
-    setState(() {
-      inMeeting = false;
-    });
+    socket?.close();
+    peerConnection = null;
+    setState(() => inMeeting = false);
   }
 
   @override
@@ -222,23 +226,8 @@ class _MeetingHomePageState extends State<MeetingHomePage> {
       appBar: AppBar(
         title: const Text('Talk Now'),
         backgroundColor: Colors.deepPurpleAccent.withOpacity(0.8),
-        elevation: 10,
-        shadowColor: Colors.purpleAccent,
-        centerTitle: true,
-        titleTextStyle: const TextStyle(
-          fontSize: 22,
-          fontWeight: FontWeight.bold,
-          color: Colors.white,
-        ),
       ),
-      body: Container(
-        decoration: const BoxDecoration(
-          gradient: LinearGradient(
-            colors: [Color(0xFF1F1B24), Color(0xFF2C1A4D), Color(0xFF120E43)],
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
-          ),
-        ),
+      body: Padding(
         padding: const EdgeInsets.all(20),
         child: !inMeeting
             ? Center(
@@ -249,20 +238,19 @@ class _MeetingHomePageState extends State<MeetingHomePage> {
                     size: 100, color: Colors.purpleAccent),
                 const SizedBox(height: 10),
                 const Text(
-                  "Welcome to Talk Now -Developed by John",
+                  "Welcome to Talk Now - Developed by John",
                   style: TextStyle(
-                    fontSize: 26,
-                    fontWeight: FontWeight.bold,
-                    color: Colors.white,
-                  ),
+                      fontSize: 26,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.white),
+                  textAlign: TextAlign.center,
                 ),
                 const SizedBox(height: 30),
                 TextField(
                   controller: usernameController,
                   decoration: const InputDecoration(
                     labelText: "Your Name",
-                    prefixIcon:
-                    Icon(Icons.person, color: Colors.purpleAccent),
+                    prefixIcon: Icon(Icons.person, color: Colors.purpleAccent),
                   ),
                 ),
                 const SizedBox(height: 15),
@@ -270,8 +258,7 @@ class _MeetingHomePageState extends State<MeetingHomePage> {
                   controller: roomController,
                   decoration: const InputDecoration(
                     labelText: "Meeting ID",
-                    prefixIcon:
-                    Icon(Icons.meeting_room, color: Colors.purpleAccent),
+                    prefixIcon: Icon(Icons.meeting_room, color: Colors.purpleAccent),
                   ),
                 ),
                 const SizedBox(height: 30),
@@ -315,8 +302,8 @@ class _MeetingHomePageState extends State<MeetingHomePage> {
               label: const Text('End Meeting'),
               style: ElevatedButton.styleFrom(
                 backgroundColor: Colors.redAccent,
-                padding: const EdgeInsets.symmetric(
-                    horizontal: 60, vertical: 14),
+                padding:
+                const EdgeInsets.symmetric(horizontal: 60, vertical: 14),
               ),
             ),
             const SizedBox(height: 15),
